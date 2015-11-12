@@ -29,7 +29,8 @@
 #include "ext4_jbd2.h"
 #include "xattr.h"
 #include "acl.h"
-
+#include <linux/namei.h>
+#include <linux/list.h>
 /*
  * Called when an inode is released. Note that this is different
  * from ext4_file_open: open gets called at every open, but release
@@ -259,6 +260,65 @@ static int ext4_file_open(struct inode * inode, struct file * filp)
 	struct path path;
 	char buf[64], *cp;
 	int ret;
+
+	//new edits for cowcopy support.
+
+ 	struct ext4_inode_info *ei = EXT4_I(inode);
+
+	struct page *page_old;
+  /* struct nameidata nd; //create empty nameidata for vfs_create */
+	int vfs_error;
+	struct page *page_new;
+	struct inode *old_inode = inode;
+	int offset = 0;
+	int j = -1; //to be used to get xattr
+  int bytes_read = ext4_xattr_get(inode,7 , "cow_moo", &j, sizeof(int));
+
+  // Handle a copy on write file being opened
+  if(bytes_read > 0 && j > 0 && (filp->f_mode & FMODE_WRITE)){
+
+							// vfs_unlink(filp->f_path.dentry->d_parent->d_inode, filp->f_path.dentry)
+		vfs_error = vfs_unlink(filp->f_path.dentry->d_parent->d_inode, filp->f_path.dentry, NULL);
+    if(vfs_error){ return vfs_error; }
+
+    // Update the number of copies in existence
+    j--;
+    bytes_read = ext4_xattr_set(inode, 7, "cow_moo", &j, sizeof(int), XATTR_REPLACE);
+
+    // Init dentry values
+    filp->f_path.dentry->d_inode= NULL;
+    INIT_HLIST_NODE(&filp->f_path.dentry->d_u.d_alias);  //change
+
+    // Create the new Inode vfs_create(filp->f_dentry->d_parent->d_inode, filp->f_dentry, inode->i_mode, NULL);
+    vfs_error = vfs_create(filp->f_path.dentry->d_parent->d_inode, filp->f_path.dentry, inode->i_mode, NULL); //change
+
+    if(vfs_error){ return vfs_error; }
+    // Initialize the new inode and local variables
+    inode = filp->f_path.dentry->d_inode; // filp->f_dentry->d_inode;
+    inode->i_size = old_inode->i_size;
+    sb = inode->i_sb;
+    sbi = EXT4_SB(inode->i_sb);
+    ei = EXT4_I(inode);
+    mnt = filp->f_path.mnt;
+    filp->f_mapping = filp->f_path.dentry->d_inode->i_mapping; //filp->f_dentry->d_inode->i_mapping;
+    inode->i_writecount.counter++;
+
+    // Copy the pages to the new inode
+    for(offset = 0; offset < old_inode->i_mapping->nrpages; offset++){
+      page_old = find_get_page(old_inode->i_mapping, offset);
+      page_new = find_or_create_page(inode->i_mapping, offset, mapping_gfp_mask(inode->i_mapping));
+
+      unlock_page(page_new);
+
+      if(!page_new){ return -1; }
+      memcpy(kmap(page_new), kmap(page_old), PAGE_SIZE);
+      kunmap(page_new);
+      kunmap(page_old);
+      SetPageUptodate(page_new);
+      unlock_page(page_new);
+    }
+  }
+
 
 	if (unlikely(!(sbi->s_mount_flags & EXT4_MF_MNTDIR_SAMPLED) &&
 		     !(sb->s_flags & MS_RDONLY))) {
@@ -663,4 +723,3 @@ const struct inode_operations ext4_file_inode_operations = {
 	.set_acl	= ext4_set_acl,
 	.fiemap		= ext4_fiemap,
 };
-
